@@ -35,27 +35,21 @@ print(
 # TimesFM expects a list of 1D numpy arrays
 input_series = df["anomaly_c"].values.astype(np.float32)
 
-# Load TimesFM 1.0 (PyTorch)
-# NOTE: TimesFM 2.5 PyTorch checkpoint has a file format issue at time of writing.
-# The model.safetensors file is not loadable via torch.load().
-# Using TimesFM 1.0 PyTorch which works correctly.
-print("\n🤖 Loading TimesFM 1.0 (200M) PyTorch...")
+print("\n🤖 Loading TimesFM 2.5 (200M) PyTorch...")
 import timesfm
 
-hparams = timesfm.TimesFmHparams(horizon_len=12)
-checkpoint = timesfm.TimesFmCheckpoint(
-    huggingface_repo_id="google/timesfm-1.0-200m-pytorch"
+model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+    "google/timesfm-2.5-200m-pytorch"
 )
-model = timesfm.TimesFm(hparams=hparams, checkpoint=checkpoint)
+model.compile(timesfm.ForecastConfig(max_context=512, max_horizon=12))
 
 # Forecast
 print("\n📈 Running forecast (12 months ahead)...")
 forecast_input = [input_series]
-frequency_input = [0]  # Monthly data
 
 point_forecast, experimental_quantile_forecast = model.forecast(
-    forecast_input,
-    freq=frequency_input,
+    horizon=12,
+    inputs=forecast_input,
 )
 
 print(f"   Point forecast shape: {point_forecast.shape}")
@@ -100,7 +94,7 @@ output_df.to_csv(output_dir / "forecast_output.csv", index=False)
 
 # JSON output for the report
 output_json = {
-    "model": "TimesFM 1.0 (200M) PyTorch",
+    "model": "TimesFM 2.5 (200M) PyTorch",
     "input": {
         "source": "NOAA GISTEMP Global Temperature Anomaly",
         "n_observations": len(df),
