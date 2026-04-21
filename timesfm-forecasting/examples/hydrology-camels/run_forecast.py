@@ -2,7 +2,9 @@
 """
 TimesFM 零样本水文预测 —— CAMELS 数据集（日尺度）
 
-策略：滑动窗口，每次用前 365 天预测下 1 天，汇总所有预测值与真实值计算 NSE。
+策略：滑动窗口，每次用前 CONTEXT_LEN 天预测后 HORIZON 天，
+      汇总所有预测值与真实值计算逐步 NSE 和整体 NSE。
+      修改预测步长只需改 HORIZON 一个变量。
 
 CAMELS-US 数据格式（usgs_streamflow）：
     gauge_id  year  month  day  streamflow(cfs)  qc_flag
@@ -17,21 +19,7 @@ import numpy as np
 import pandas as pd
 import timesfm
 
-# ============================================================
-# 配置区：按需修改
-# ============================================================
-
-# CAMELS-US 数据集根目录
-DATA_DIR = Path(r"D:\download\camels")
-
-# 要预测的站点列表（USGS gauge ID）
-GAUGE_IDS = [
-    "01013500",
-    "01022500",
-    "01030500",
-]
-
-# ============================================================
+from config import DATA_DIR, GAUGE_IDS
 
 CONTEXT_LEN = 365   # 上下文长度：1 年
 HORIZON = 1         # 预测步长：1 天
@@ -66,20 +54,27 @@ def load_camels_us(data_dir: Path, gauge_id: str) -> pd.Series:
 # 预测
 # ---------------------------------------------------------------------------
 
-def build_windows(series: np.ndarray, context: int) -> tuple[list[np.ndarray], np.ndarray]:
-    """从连续序列构建滑动窗口。返回 (windows, true_values)。"""
+def build_windows(
+    series: np.ndarray, context: int, horizon: int
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """构建滑动窗口。
+    返回:
+        windows    : 长度为 n_windows 的列表，每个元素 shape=(context,)
+        true_values: shape=(n_windows, horizon)，每行是对应窗口的未来 horizon 步真实值
+    """
     n = len(series)
-    if n <= context:
-        raise ValueError(f"数据长度 {n} 不足以构建长度为 {context} 的上下文窗口。")
-    windows = [series[i : i + context] for i in range(n - context)]
-    true_values = series[context:]
-    return windows, true_values
+    if n < context + horizon:
+        raise ValueError(f"数据长度 {n} 不足以构建 context={context} + horizon={horizon} 的窗口。")
+    n_windows = n - context - horizon + 1
+    windows = [series[i : i + context] for i in range(n_windows)]
+    true_values = np.stack([series[i + context : i + context + horizon] for i in range(n_windows)])
+    return windows, true_values  # true_values: (n_windows, horizon)
 
 
 def run_forecast(model: timesfm.TimesFM_2p5_200M_torch, windows: list[np.ndarray]) -> np.ndarray:
-    """批量推理，返回每个窗口下一步的点预测，shape=(n_windows,)。"""
+    """批量推理，返回所有窗口的点预测，shape=(n_windows, HORIZON)。"""
     point_forecast, _ = model.forecast(horizon=HORIZON, inputs=windows)
-    return point_forecast[:, 0]  # (n_windows, 1) -> (n_windows,)
+    return point_forecast  # (n_windows, HORIZON)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +87,22 @@ def nse(obs: np.ndarray, sim: np.ndarray) -> float:
     if denom == 0:
         return float("nan")
     return float(1.0 - np.sum((obs - sim) ** 2) / denom)
+
+
+def compute_nse_metrics(true_values: np.ndarray, pred_values: np.ndarray) -> dict:
+    """计算 NSE 指标。
+    HORIZON=1 时只计算 nse_overall；
+    HORIZON>1 时同时计算每步 nse_step_k 和整体 nse_overall。
+    Args:
+        true_values: shape=(n_windows, horizon)
+        pred_values: shape=(n_windows, horizon)
+    """
+    metrics = {}
+    if HORIZON > 1:
+        for k in range(HORIZON):
+            metrics[f"nse_step_{k+1}"] = nse(true_values[:, k], pred_values[:, k])
+    metrics["nse_overall"] = nse(true_values.ravel(), pred_values.ravel())
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -111,27 +122,37 @@ def forecast_single_gauge(
     series = load_camels_us(data_dir, gauge_id)
     print(f"  数据范围: {series.index[0].date()} ~ {series.index[-1].date()}  ({len(series)} 天)")
 
-    windows, true_values = build_windows(series.values, CONTEXT_LEN)
+    windows, true_values = build_windows(series.values, CONTEXT_LEN, HORIZON)
     print(f"  滑动窗口数: {len(windows)}")
 
     print("  推理中...")
-    pred_values = run_forecast(model, windows)
+    pred_values = run_forecast(model, windows)  # (n_windows, HORIZON)
 
-    score = nse(true_values, pred_values)
-    print(f"  NSE = {score:.4f}")
+    metrics = compute_nse_metrics(true_values, pred_values)
+    if HORIZON > 1:
+        for k in range(HORIZON):
+            print(f"  NSE step-{k+1}: {metrics[f'nse_step_{k+1}']:.4f}")
+    print(f"  NSE 整体:    {metrics['nse_overall']:.4f}")
 
-    # 保存预测结果
-    result_dates = series.index[CONTEXT_LEN:]
-    out_df = pd.DataFrame({
-        "date": result_dates,
-        "obs_cfs": true_values,
-        "pred_cfs": pred_values,
-    })
+    # 保存预测结果（长格式：每行一个 window × step 对）
+    n_windows = len(windows)
+    rows = []
+    for i in range(n_windows):
+        context_end_date = series.index[i + CONTEXT_LEN - 1]
+        for k in range(HORIZON):
+            rows.append({
+                "context_end_date": context_end_date.date(),
+                "lead_day": k + 1,
+                "forecast_date": series.index[i + CONTEXT_LEN + k].date(),
+                "obs_cfs": true_values[i, k],
+                "pred_cfs": pred_values[i, k],
+            })
+    out_df = pd.DataFrame(rows)
     out_path = output_dir / f"{gauge_id}_forecast.csv"
     out_df.to_csv(out_path, index=False)
     print(f"  结果已保存: {out_path}")
 
-    return {"gauge_id": gauge_id, "n_days": len(true_values), "nse": score}
+    return {"gauge_id": gauge_id, "n_windows": n_windows, **metrics}
 
 
 def main():
@@ -168,9 +189,10 @@ def main():
     print(f"{'='*55}")
     print(summary_df.to_string(index=False))
     if len(results) > 1:
-        valid = summary_df["nse"].dropna()
-        print(f"\n  中位数 NSE: {valid.median():.4f}")
-        print(f"  平均   NSE: {valid.mean():.4f}")
+        print("\n  各指标中位数:")
+        nse_cols = [c for c in summary_df.columns if c.startswith("nse_")]
+        for col in nse_cols:
+            print(f"    {col}: {summary_df[col].median():.4f}")
     print(f"\n  汇总已保存: {summary_path}")
 
 

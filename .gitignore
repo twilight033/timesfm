@@ -9,3 +9,5 @@ results/
 uv.lock
 development_setup.md
 debug.log
+timesfm-forecasting/examples/hydrology-camels/output/
+timesfm-forecasting/examples/hydrology-camels/config.py
