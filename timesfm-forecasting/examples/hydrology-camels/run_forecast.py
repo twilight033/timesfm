@@ -123,10 +123,12 @@ def forecast_single_gauge(
     print(f"  数据范围: {series.index[0].date()} ~ {series.index[-1].date()}  ({len(series)} 天)")
 
     windows, true_values = build_windows(series.values, CONTEXT_LEN, HORIZON)
-    print(f"  滑动窗口数: {len(windows)}")
+    n_windows = len(windows)  # 在 forecast 前记录，防止模型就地填充 windows 列表
+    print(f"  滑动窗口数: {n_windows}")
 
     print("  推理中...")
     pred_values = run_forecast(model, windows)  # (n_windows, HORIZON)
+    pred_values = pred_values[:n_windows]       # 裁剪掉模型可能补齐的填充预测
 
     metrics = compute_nse_metrics(true_values, pred_values)
     if HORIZON > 1:
@@ -135,7 +137,6 @@ def forecast_single_gauge(
     print(f"  NSE 整体:    {metrics['nse_overall']:.4f}")
 
     # 保存预测结果（长格式：每行一个 window × step 对）
-    n_windows = len(windows)
     rows = []
     for i in range(n_windows):
         context_end_date = series.index[i + CONTEXT_LEN - 1]
