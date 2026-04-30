@@ -1,0 +1,5 @@
+﻿context_len,horizon,stations_usable_whole_series,stations_usable_longest_segment,total_windows_from_longest_segment
+48,1,122,118,22135
+96,1,122,101,16866
+180,1,121,76,9574
+365,1,114,12,1965
