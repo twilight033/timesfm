@@ -181,6 +181,12 @@ def filter_liaohe(
     return {k: v for k, v in station_segments.items() if k.startswith("liaohe_")}
 
 
+def filter_camels(
+    station_segments: dict[str, list[Segment]]
+) -> dict[str, list[Segment]]:
+    return {k: v for k, v in station_segments.items() if k.startswith("camels_")}
+
+
 def flatten_segments(
     station_segments: dict[str, list[Segment]]
 ) -> list[Segment]:

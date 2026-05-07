@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader
 from finetune_data import (
     RandomWindowDataset,
     build_or_load_segments,
+    filter_camels,
     filter_liaohe,
     flatten_segments,
     set_seed,
@@ -254,7 +255,7 @@ def evaluate_nse(
             bundle["target_in_flood"],
         )
         rows.append({
-            "station": station.replace("liaohe_", ""),
+            "station": station.replace("liaohe_", "").replace("camels_", ""),
             "n_windows": n_win,
             **m,
         })
@@ -300,15 +301,23 @@ def run_one_method(args) -> dict:
     train_segs_d, val_segs_d = split_by_time(seg_all, train_ratio=args.train_ratio)
     train_segs = flatten_segments(train_segs_d)
     val_segs_for_loss = flatten_segments(val_segs_d)
-    liaohe_val_d = filter_liaohe(val_segs_d)
+    if args.eval_domain == "camels":
+        eval_val_d = filter_camels(val_segs_d)
+    else:
+        eval_val_d = filter_liaohe(val_segs_d)
     logger.info(
-        "训练段 %d, 验证段 %d, 辽河 val 站 %d",
-        len(train_segs), len(val_segs_for_loss), len(liaohe_val_d),
+        "训练段 %d, 验证段 %d, eval_domain=%s, eval 站 %d",
+        len(train_segs), len(val_segs_for_loss), args.eval_domain, len(eval_val_d),
     )
 
     method_dir = OUT_ROOT / args.method
     method_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = method_dir / "metrics.json"
+    if args.eval_domain == "liaohe":
+        metrics_path = method_dir / "metrics.json"
+        eval_method_tag = args.method
+    else:
+        metrics_path = method_dir / f"metrics_{args.eval_domain}.json"
+        eval_method_tag = f"{args.method}_{args.eval_domain}"
     train_metrics: dict = {}
 
     # ---- 训练 ----
@@ -341,15 +350,16 @@ def run_one_method(args) -> dict:
     eval_model = reload_for_eval(args.method, args.model_id, method_dir, device)
     df = evaluate_nse(
         eval_model,
-        liaohe_val_d,
+        eval_val_d,
         device=device,
         context_len=args.context_len,
         horizon=args.horizon,
         batch_size=args.batch_size,
         save_dir=method_dir,
-        method_tag=args.method,
+        method_tag=eval_method_tag,
     )
     summary = summarize(df, args.method)
+    summary["eval_domain"] = args.eval_domain
     full = {**summary, **train_metrics, "args": vars(args)}
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(full, f, ensure_ascii=False, indent=2, default=str)
@@ -384,6 +394,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--refresh_cache", action="store_true")
     p.add_argument("--eval_only", action="store_true")
+    p.add_argument(
+        "--eval_domain",
+        choices=["liaohe", "camels"],
+        default="liaohe",
+        help="评估流域：liaohe（默认，辽河 val 段）或 camels（CAMELS-US val 段）",
+    )
     args = p.parse_args()
     if args.max_camels_basins is not None and args.max_camels_basins < 0:
         args.max_camels_basins = None
