@@ -30,7 +30,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from finetune_data import (
+    EvalSegment,
     RandomWindowDataset,
+    build_eval_windows,
     build_or_load_segments,
     filter_camels,
     filter_liaohe,
@@ -42,7 +44,6 @@ from run_forecast_liaohe import (
     CONTEXT_LEN as DEFAULT_CTX,
     HORIZON as DEFAULT_HORIZON,
     Segment,
-    build_windows_from_segments,
     compute_nse_metrics,
     safe_filename,
 )
@@ -223,7 +224,7 @@ def train_loop(args, model, train_ds, val_ds, ckpt_dir: Path) -> dict:
 @torch.no_grad()
 def evaluate_nse(
     model,
-    liaohe_val_segments: dict[str, list[Segment]],
+    liaohe_val_segments: dict[str, list[EvalSegment]],
     device: str,
     context_len: int,
     horizon: int,
@@ -235,7 +236,9 @@ def evaluate_nse(
     rows = []
     model.eval()
     for station, segs in liaohe_val_segments.items():
-        bundle = build_windows_from_segments(segs, context_len, horizon)
+        # 使用 build_eval_windows：context 允许跨切分点回看 train 期，
+        # 只要求 target 落在 val 期（seg.val_start 之后）
+        bundle = build_eval_windows(segs, context_len, horizon)
         if bundle is None:
             continue
         n_win = len(bundle["contexts"])
