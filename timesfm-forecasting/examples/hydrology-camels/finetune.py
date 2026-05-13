@@ -300,7 +300,14 @@ def run_one_method(args) -> dict:
         max_camels_basins=args.max_camels_basins,
         seed=args.seed,
         refresh=args.refresh_cache,
+        max_ffill=getattr(args, "max_ffill", 7),
     )
+    # 按 train_domain 过滤训练数据
+    train_domain = getattr(args, "train_domain", "all")
+    if train_domain == "camels":
+        seg_all = filter_camels(seg_all)
+    elif train_domain == "liaohe":
+        seg_all = filter_liaohe(seg_all)
     train_segs_d, val_segs_d = split_by_time(seg_all, train_ratio=args.train_ratio)
     train_segs = flatten_segments(train_segs_d)
     val_segs_for_loss = flatten_segments(val_segs_d)
@@ -403,6 +410,14 @@ def parse_args() -> argparse.Namespace:
         default="liaohe",
         help="评估流域：liaohe（默认，辽河 val 段）或 camels（CAMELS-US val 段）",
     )
+    p.add_argument(
+        "--train_domain",
+        choices=["all", "camels", "liaohe"],
+        default="all",
+        help="训练数据来源：all（默认，CAMELS+辽河）、camels（仅 CAMELS-US）、liaohe（仅辽河）",
+    )
+    p.add_argument("--max_ffill", type=int, default=7,
+                   help="CAMELS 缺测前向填充的最大天数（超过则切段）")
     args = p.parse_args()
     if args.max_camels_basins is not None and args.max_camels_basins < 0:
         args.max_camels_basins = None

@@ -3,8 +3,10 @@
 统一加载 CAMELS-US + 辽河松花江数据 → Segment 列表 → 随机窗口数据集。
 
 设计：
-  1. CAMELS-US 与辽河共用 run_forecast_liaohe.build_segments 切段逻辑
-     （汛期 ffill / 非汛期插值 / gap 超阈值切段）。
+  1. CAMELS-US 用简化版切段逻辑（build_segments_camels）：
+     - 不区分汛期/非汛期，缺测统一前向填充（ffill）
+     - gap 超过 max_ffill 天则切段
+     辽河松花江沿用原 build_segments（汛期 ffill / 非汛期插值）。
   2. 训练/评估按"段内时间"切分：
        - train 段：截到前 train_ratio，避免未来泄漏。
        - val 段：保留完整 segment + val_start 标记（EvalSegment），
@@ -87,10 +89,92 @@ def discover_camels_files(
     return files
 
 
+# ---------------------------------------------------------------------------
+# CAMELS 简化切段（不区分汛期/非汛期）
+# ---------------------------------------------------------------------------
+
+def _finalize_segment_camels(dates, values, observed) -> Segment:
+    """构建 Segment，in_flood 全为 False（CAMELS 不区分汛期）。"""
+    didx = pd.DatetimeIndex(dates)
+    return Segment(
+        dates=didx,
+        values=np.asarray(values, dtype=np.float32),
+        is_observed=np.asarray(observed, dtype=bool),
+        in_flood=np.zeros(len(dates), dtype=bool),
+    )
+
+
+def build_segments_camels(
+    series: pd.Series,
+    max_ffill: int = 7,
+) -> list[Segment]:
+    """对单站日级序列构建连续段（CAMELS 简化版）。
+
+    与辽河版 build_segments 的区别：
+      - 不区分汛期/非汛期
+      - 缺测统一前向填充（ffill），超过 max_ffill 天的 gap 切为新段
+      - in_flood 全部标记为 False
+    """
+    if len(series) == 0:
+        return []
+
+    # 日级聚合
+    s = series.copy()
+    s.index = pd.DatetimeIndex(s.index).normalize()
+    s = s.groupby(s.index).mean().sort_index().astype(np.float32)
+
+    obs_dates = s.index
+    obs_values = s.values
+
+    segments: list[Segment] = []
+    cur_dates: list = [obs_dates[0]]
+    cur_values: list = [float(obs_values[0])]
+    cur_observed: list = [True]
+
+    for i in range(1, len(obs_dates)):
+        prev_d = obs_dates[i - 1]
+        cur_d = obs_dates[i]
+        prev_v = float(obs_values[i - 1])
+        cur_v = float(obs_values[i])
+        gap_days = (cur_d - prev_d).days
+
+        if gap_days <= 0:
+            continue
+
+        if gap_days == 1:
+            cur_dates.append(cur_d)
+            cur_values.append(cur_v)
+            cur_observed.append(True)
+            continue
+
+        # 缺测天数 = gap_days - 1，超过 max_ffill 则切段
+        if (gap_days - 1) > max_ffill:
+            segments.append(_finalize_segment_camels(cur_dates, cur_values, cur_observed))
+            cur_dates = [cur_d]
+            cur_values = [cur_v]
+            cur_observed = [True]
+            continue
+
+        # 前向填充所有缺失日
+        gap_inner = pd.date_range(
+            prev_d + pd.Timedelta(days=1), cur_d - pd.Timedelta(days=1), freq="D"
+        )
+        for gd in gap_inner:
+            cur_dates.append(gd)
+            cur_values.append(prev_v)
+            cur_observed.append(False)
+        cur_dates.append(cur_d)
+        cur_values.append(cur_v)
+        cur_observed.append(True)
+
+    segments.append(_finalize_segment_camels(cur_dates, cur_values, cur_observed))
+    return segments
+
+
 def load_camels_segments(
-    max_basins: int | None = None, seed: int = 42
+    max_basins: int | None = None, seed: int = 42, max_ffill: int = 7
 ) -> dict[str, list[Segment]]:
-    """每个 CAMELS-US 站点 → segments；剔 -999 后复用辽河切段逻辑。"""
+    """每个 CAMELS-US 站点 → segments（简化版切段：不区分汛期/非汛期）。"""
     files = discover_camels_files(max_basins, seed=seed)
     out: dict[str, list[Segment]] = {}
     for i, f in enumerate(files):
@@ -99,7 +183,7 @@ def load_camels_segments(
             s = _load_camels_us_station(f)
             if len(s) == 0:
                 continue
-            segs = build_segments(s)
+            segs = build_segments_camels(s, max_ffill=max_ffill)
             if segs:
                 out[f"camels_{gauge_id}"] = segs
         except Exception as e:
@@ -127,16 +211,17 @@ def build_or_load_segments(
     max_camels_basins: int | None = 200,
     seed: int = 42,
     refresh: bool = False,
+    max_ffill: int = 7,
 ) -> dict[str, list[Segment]]:
     CACHE_DIR.mkdir(exist_ok=True)
     tag = "all" if max_camels_basins is None else str(max_camels_basins)
-    cache = CACHE_DIR / f"segments_camels{tag}_seed{seed}.pkl"
+    cache = CACHE_DIR / f"segments_camels{tag}_seed{seed}_ffill{max_ffill}.pkl"
     if cache.exists() and not refresh:
         print(f"  [cache] 加载 {cache}")
         with cache.open("rb") as f:
             return pickle.load(f)
-    print(f"  构建 segments（CAMELS≤{max_camels_basins} + 辽河全部）...")
-    camels = load_camels_segments(max_camels_basins, seed=seed)
+    print(f"  构建 segments（CAMELS≤{max_camels_basins} + 辽河全部，max_ffill={max_ffill}）...")
+    camels = load_camels_segments(max_camels_basins, seed=seed, max_ffill=max_ffill)
     liaohe = load_liaohe_segments()
     merged = {**camels, **liaohe}
     print(f"  CAMELS 站 {len(camels)}, 辽河 站 {len(liaohe)}, 共 {len(merged)}")
