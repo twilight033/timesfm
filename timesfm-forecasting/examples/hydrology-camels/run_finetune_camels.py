@@ -48,7 +48,7 @@ def main() -> None:
         choices=ALL_METHODS,
         help="要跑的方法列表（按顺序执行）",
     )
-    p.add_argument("--model_id", default="google/timesfm-2.5-200m-transformers")
+DEFAULT_MODEL_ID = "D:/models/timesfm-2.5-200m-transformers"
     p.add_argument("--context_len", type=int, default=384)
     p.add_argument("--horizon", type=int, default=1)
     p.add_argument("--max_camels_basins", type=int, default=200,
