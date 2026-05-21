@@ -41,7 +41,7 @@ FLOOD_MONTHS = {6, 7, 8, 9}
 MAX_FLOOD_FFILL = 7   # 汛期内允许 ffill 的最大跨度（天）
 MAX_DRY_INTERP = 90   # 非汛期内允许线性插值的最大跨度（天）
 
-CONTEXT_LEN = 365
+CONTEXT_LEN = 384
 HORIZON = 1
 BATCH_SIZE = 32
 

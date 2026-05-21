@@ -52,7 +52,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 OUT_ROOT = Path(__file__).parent / "output_finetune"
-DEFAULT_MODEL_ID = "google/timesfm-2.5-200m-transformers"
+DEFAULT_MODEL_ID = r"D:/models/timesfm-2.5-200m-transformers"
 
 
 # ---------------------------------------------------------------------------
