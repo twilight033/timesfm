@@ -45,7 +45,21 @@ from lstm_xreg import (
     load_camels_static_attrs,
     train_lstm,
 )
-from run_forecast import load_camels_us
+
+
+def load_camels_us(data_dir: Path, gauge_id: str) -> pd.Series:
+    """加载 CAMELS-US 单站点日径流序列，返回按日期索引的 Series（单位 cfs）。"""
+    files = list(data_dir.glob(f"**/{gauge_id}_streamflow_qc.txt"))
+    if not files:
+        raise FileNotFoundError(f"未找到站点 {gauge_id} 的径流文件，请检查 data_dir 路径。")
+    df = pd.read_csv(
+        files[0], sep=r"\s+", header=None,
+        names=["gauge_id", "year", "month", "day", "streamflow", "qc"],
+    )
+    df["date"] = pd.to_datetime(df[["year", "month", "day"]])
+    df["streamflow"] = pd.to_numeric(df["streamflow"], errors="coerce")
+    df = df[df["streamflow"] >= 0].set_index("date")["streamflow"]
+    return df.sort_index().astype(np.float32)
 
 logging.basicConfig(
     level=logging.INFO,
