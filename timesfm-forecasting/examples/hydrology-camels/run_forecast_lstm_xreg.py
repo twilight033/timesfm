@@ -181,11 +181,13 @@ def load_gauge(
     static_df: pd.DataFrame,
     model_hf,
     device: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    train_frac: float = 0.8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int] | None:
     """加载单站数据并预计算 TimesFM 滚动预测。
 
     Returns:
-        (dyn [T, N_DYN], sf [T], static [N_STATIC], tf_preds [T]) 或 None
+        (dyn [T, N_DYN], sf [T], static [N_STATIC], tf_preds [T], split_idx) 或 None
+        split_idx：训练/评估时间切分点索引（前 split_idx 天为训练期）
     """
     try:
         streamflow = load_camels_us(STREAMFLOW_ROOT, gauge_id)
@@ -212,12 +214,15 @@ def load_gauge(
         col_means = static_df[STATIC_ATTR_COLS].mean().values.astype(np.float32)
         static = np.where(np.isnan(static), col_means, static)
 
-    # 预计算 TimesFM 滚动预测
+    # 时间切分点：前 train_frac 为训练期
+    split_idx = int(len(sf) * train_frac)
+
+    # 预计算 TimesFM 滚动预测（全段，训练和评估均需要）
     n_windows = len(sf) - CONTEXT_LEN - HORIZON + 1
     logger.info("[%s] 预计算 TimesFM 滚动预测（%d 个窗口）...", gauge_id, n_windows)
     tf_preds = precompute_tf_forecasts(sf, model_hf, CONTEXT_LEN, HORIZON, BATCH_SIZE, device)
 
-    return dyn, sf, static, tf_preds
+    return dyn, sf, static, tf_preds, split_idx
 
 
 # ---------------------------------------------------------------------------
@@ -244,22 +249,26 @@ def forecast_single_gauge(
     static: np.ndarray,    # [N_STATIC]
     tf_preds: np.ndarray,  # [T] 预计算的 TimesFM 预测
     predictor: LSTMXRegPredictor,
+    eval_start: int = 0,   # target 起点必须 >= eval_start（0 表示不限制）
 ) -> dict | None:
     """滑动窗口推理：微调 TimesFM + LSTM 残差，并与 TimesFM-only 基线对比。
 
     最终预测 = tf_hor + lstm_resid
       tf_hor    ：预计算的 TimesFM 预测（直接查表，无需重复调用模型）
       lstm_resid：LSTM 对残差的预测
+    eval_start  ：只评估 target 落在 [eval_start, T) 的窗口（上下文可跨越切分点）
     """
     n = len(sf)
     n_windows = n - CONTEXT_LEN - HORIZON + 1
     if n_windows <= 0:
         return None
 
-    # 只保留 tf_preds 完整（无 NaN）的窗口
+    # 只保留 tf_preds 完整且 target 落在评估期的窗口
+    # i + CONTEXT_LEN 为 target 起点，要求 >= eval_start
     valid_idx = [
         i for i in range(n_windows)
-        if not np.isnan(tf_preds[i + CONTEXT_LEN : i + CONTEXT_LEN + HORIZON]).any()
+        if (i + CONTEXT_LEN >= eval_start)
+        and not np.isnan(tf_preds[i + CONTEXT_LEN : i + CONTEXT_LEN + HORIZON]).any()
     ]
     if not valid_idx:
         logger.warning("[%s] 无有效 tf_preds 窗口，跳过", gauge_id)
@@ -331,12 +340,18 @@ def main(args: argparse.Namespace) -> None:
     all_gauges = sorted(set(train_gauges) | set(eval_gauges))
     gauge_cache: dict[str, tuple] = {}
     for gid in all_gauges:
-        result = load_gauge(gid, static_df, model_hf, device)
+        result = load_gauge(gid, static_df, model_hf, device, train_frac=args.train_frac)
         if result is not None:
             gauge_cache[gid] = result
 
-    # 训练数组（4 元组列表）
-    train_arrays = [gauge_cache[gid] for gid in sorted(set(train_gauges)) if gid in gauge_cache]
+    # 训练数组：每站只取前 split_idx 天（训练期），传给 train_lstm 的是 4 元组
+    train_arrays = []
+    for gid in sorted(set(train_gauges)):
+        if gid not in gauge_cache:
+            continue
+        dyn, sf, static, tf_preds, split_idx = gauge_cache[gid]
+        # 截取训练期；LSTM 的 _WindowDataset 只会生成 target 落在 [:split_idx] 内的窗口
+        train_arrays.append((dyn[:split_idx], sf[:split_idx], static, tf_preds[:split_idx]))
     if not train_arrays:
         raise RuntimeError("没有可用的训练站点，请检查数据路径。")
 
@@ -374,9 +389,10 @@ def main(args: argparse.Namespace) -> None:
             logger.warning("[%s] 数据不可用，跳过", gid)
             continue
         logger.info("推理站点: %s", gid)
-        dyn, sf, static, tf_preds = gauge_cache[gid]
+        dyn, sf, static, tf_preds, split_idx = gauge_cache[gid]
         try:
-            r = forecast_single_gauge(gid, dyn, sf, static, tf_preds, predictor)
+            r = forecast_single_gauge(gid, dyn, sf, static, tf_preds, predictor,
+                                      eval_start=split_idx)
             if r is not None:
                 results.append(r)
                 logger.info(
@@ -431,6 +447,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--skip_train", action="store_true", help="跳过训练，从 _lstm_ckpt 加载")
     p.add_argument("--train_only", action="store_true", help="只训练 LSTM，不做推理")
+    p.add_argument(
+        "--train_frac", type=float, default=0.8,
+        help="训练/评估时间切分比例（默认 0.8：前80%%训练，后20%%评估）",
+    )
 
     # 微调 TimesFM 参数
     p.add_argument(
