@@ -100,6 +100,7 @@ def _load_finetuned_model(method: str, model_id: str, finetune_dir: Path, device
         model_id,
         torch_dtype=torch.bfloat16,
         device_map=device,
+        local_files_only=True,
     )
     base.eval()
 
