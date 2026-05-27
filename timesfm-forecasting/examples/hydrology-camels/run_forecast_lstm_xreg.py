@@ -86,7 +86,7 @@ OUTPUT_DIR = Path(__file__).parent / "output_lstm_xreg"
 FINETUNE_OUT_ROOT = Path(__file__).parent / "output_finetune"
 TF_CACHE_DIR = Path(__file__).parent / "_tf_preds_cache"
 
-DEFAULT_MODEL_ID = "google/timesfm-2.5-200m-transformers"
+DEFAULT_MODEL_ID = "D:/models/timesfm-2.5-200m-transformers"
 
 
 # ---------------------------------------------------------------------------
