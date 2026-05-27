@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 
 CONTEXT_LEN = 365
 HORIZON = 1
-BATCH_SIZE = 32
+BATCH_SIZE = 512
 
 STREAMFLOW_ROOT = (
     DATA_DIR / "camels_us" / "CAMELS_US"
@@ -84,6 +84,7 @@ STREAMFLOW_ROOT = (
 CKPT_DIR = Path(__file__).parent / "_lstm_ckpt"
 OUTPUT_DIR = Path(__file__).parent / "output_lstm_xreg"
 FINETUNE_OUT_ROOT = Path(__file__).parent / "output_finetune"
+TF_CACHE_DIR = Path(__file__).parent / "_tf_preds_cache"
 
 DEFAULT_MODEL_ID = "google/timesfm-2.5-200m-transformers"
 
@@ -182,6 +183,7 @@ def load_gauge(
     model_hf,
     device: str,
     train_frac: float = 0.8,
+    args_method: str = "lora_r4",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int] | None:
     """加载单站数据并预计算 TimesFM 滚动预测。
 
@@ -217,10 +219,21 @@ def load_gauge(
     # 时间切分点：前 train_frac 为训练期
     split_idx = int(len(sf) * train_frac)
 
-    # 预计算 TimesFM 滚动预测（全段，训练和评估均需要）
+    # 预计算 TimesFM 滚动预测（先查磁盘缓存，命中则跳过推理）
+    cache_path = TF_CACHE_DIR / f"{gauge_id}_{args_method}.npy"
+    if cache_path.exists():
+        cached = np.load(cache_path)
+        if len(cached) == len(sf):
+            logger.info("[%s] 从缓存加载 tf_preds", gauge_id)
+            return dyn, sf, static, cached, split_idx
+        logger.warning("[%s] 缓存长度不匹配（%d vs %d），重新计算", gauge_id, len(cached), len(sf))
+
     n_windows = len(sf) - CONTEXT_LEN - HORIZON + 1
     logger.info("[%s] 预计算 TimesFM 滚动预测（%d 个窗口）...", gauge_id, n_windows)
     tf_preds = precompute_tf_forecasts(sf, model_hf, CONTEXT_LEN, HORIZON, BATCH_SIZE, device)
+    TF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, tf_preds)
+    logger.info("[%s] tf_preds 已缓存至 %s", gauge_id, cache_path)
 
     return dyn, sf, static, tf_preds, split_idx
 
@@ -327,6 +340,7 @@ def main(args: argparse.Namespace) -> None:
 
     # ---- 2. 微调 TimesFM（HF 格式，用于预计算） ----
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("使用设备: %s", device)
     finetune_dir = Path(args.finetune_dir) if args.finetune_dir else (
         FINETUNE_OUT_ROOT / args.finetune_method
     )
@@ -340,7 +354,8 @@ def main(args: argparse.Namespace) -> None:
     all_gauges = sorted(set(train_gauges) | set(eval_gauges))
     gauge_cache: dict[str, tuple] = {}
     for gid in all_gauges:
-        result = load_gauge(gid, static_df, model_hf, device, train_frac=args.train_frac)
+        result = load_gauge(gid, static_df, model_hf, device, train_frac=args.train_frac,
+                            args_method=args.finetune_method)
         if result is not None:
             gauge_cache[gid] = result
 
