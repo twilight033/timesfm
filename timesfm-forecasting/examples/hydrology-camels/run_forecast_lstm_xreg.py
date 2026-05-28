@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 
 CONTEXT_LEN = 365
 HORIZON = 1
-BATCH_SIZE = 512
+BATCH_SIZE = 64
 
 STREAMFLOW_ROOT = (
     DATA_DIR / "camels_us" / "CAMELS_US"

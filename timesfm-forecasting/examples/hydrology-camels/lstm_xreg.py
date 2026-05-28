@@ -105,8 +105,10 @@ N_FEATURES = N_DYNAMIC + N_STATIC         # 30（LSTM 输入维度）
 def load_camels_forcing(camels_root: Path, gauge_id: str) -> pd.DataFrame:
     """加载单站 Daymet 强迫，仅保留 prcp, tmax, tmin。"""
     forcing_root = camels_root / FORCING_ROOT_REL
-    subdir = gauge_id[:2]
-    path = forcing_root / subdir / f"{gauge_id}_lump_cida_forcing_leap.txt"
+    files = list(forcing_root.glob(f"**/{gauge_id}_lump_cida_forcing_leap.txt"))
+    if not files:
+        raise FileNotFoundError(f"未找到站点 {gauge_id} 的 Daymet 强迫文件，请检查路径。")
+    path = files[0]
     all_raw = ["Year", "Mnth", "Day", "Hr",
                "dayl(s)", "prcp(mm/day)", "srad(W/m2)",
                "swe(mm)", "tmax(C)", "tmin(C)", "vp(Pa)"]
