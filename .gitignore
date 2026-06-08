@@ -13,3 +13,5 @@ timesfm-forecasting/examples/hydrology-camels/output*/
 timesfm-forecasting/examples/hydrology-camels/_finetune_cache/
 timesfm-forecasting/examples/hydrology-camels/config.py
 .codegraph/
+timesfm-forecasting/examples/hydrology-camels/_tf_preds_cache
+timesfm-forecasting/examples/hydrology-camels/_lstm_ckpt
