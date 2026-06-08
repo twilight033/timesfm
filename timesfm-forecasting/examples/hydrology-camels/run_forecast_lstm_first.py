@@ -110,6 +110,13 @@ def load_gauge_data(
     return dyn, sf, static, split_idx
 
 
+def discover_all_gauges() -> list[str]:
+    """递归扫描 usgs_streamflow 目录，发现 CAMELS-US 全部站点 gauge_id（排序、去重）。"""
+    files = STREAMFLOW_ROOT.glob("**/*_streamflow_qc.txt")
+    gauges = {f.stem.split("_")[0] for f in files}
+    return sorted(gauges)
+
+
 # ---------------------------------------------------------------------------
 # TimesFM 对残差序列滚动预测（处理 NaN 前缀 + 有效区对齐）
 # ---------------------------------------------------------------------------
@@ -239,7 +246,15 @@ def evaluate_gauge(
 def main(args: argparse.Namespace) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    eval_gauges  = args.gauges       or GAUGE_IDS
+    if args.all_gauges:
+        eval_gauges = discover_all_gauges()
+        logger.info("发现 CAMELS-US 全部站点 %d 个", len(eval_gauges))
+        if args.max_gauges is not None:
+            eval_gauges = eval_gauges[: args.max_gauges]
+            logger.info("按 --max_gauges 限制为前 %d 个站点", len(eval_gauges))
+    else:
+        eval_gauges = args.gauges or GAUGE_IDS
+    # 默认：训练与评估用同一批站点（多站联合训练 + 各站时间切分评估，CAMELS LSTM 标准做法）
     train_gauges = args.train_gauges or eval_gauges
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -383,6 +398,10 @@ def parse_args() -> argparse.Namespace:
                    help="评估站点列表（默认 config.py 的 GAUGE_IDS）")
     p.add_argument("--train_gauges", nargs="+", default=None,
                    help="训练 LSTM 的站点列表（默认与评估站点相同）")
+    p.add_argument("--all_gauges", action="store_true",
+                   help="在 CAMELS-US 全部站点上训练+评估（自动发现，覆盖 --gauges）")
+    p.add_argument("--max_gauges", type=int, default=None,
+                   help="限制站点数量（配合 --all_gauges，便于分批/测试）")
     p.add_argument("--skip_train", action="store_true", help="跳过训练，从 _lstm_first_ckpt 加载")
     p.add_argument("--train_only", action="store_true", help="只训练 LSTM，不做推理")
     p.add_argument("--train_frac", type=float, default=0.8,
