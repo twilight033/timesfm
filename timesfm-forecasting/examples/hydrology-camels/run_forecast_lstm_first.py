@@ -78,9 +78,13 @@ CACHE_DIR = Path(__file__).parent / "_lstm_first_cache"
 def load_gauge_data(
     gauge_id: str,
     static_df: pd.DataFrame,
-    train_frac: float = 0.8,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
-    """加载单站数据，返回 (dyn [T,N_DYN], sf [T], static [N_STATIC], split_idx) 或 None。"""
+    train_frac: float = 0.7,
+    val_frac: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int] | None:
+    """加载单站数据，返回 (dyn [T,N_DYN], sf [T], static [N_STATIC], train_end, val_end) 或 None。
+
+    三段时间切分：训练 [0, train_end) / 验证 [train_end, val_end) / 测试 [val_end, T)。
+    """
     try:
         streamflow = load_camels_us(STREAMFLOW_ROOT, gauge_id)
         forcing = load_camels_forcing(DATA_DIR, gauge_id)
@@ -106,8 +110,9 @@ def load_gauge_data(
         col_means = static_df[STATIC_ATTR_COLS].mean().values.astype(np.float32)
         static = np.where(np.isnan(static), col_means, static)
 
-    split_idx = int(len(sf) * train_frac)
-    return dyn, sf, static, split_idx
+    train_end = int(len(sf) * train_frac)
+    val_end = int(len(sf) * (train_frac + val_frac))
+    return dyn, sf, static, train_end, val_end
 
 
 def discover_all_gauges() -> list[str]:
@@ -269,20 +274,26 @@ def main(args: argparse.Namespace) -> None:
     all_gauges = sorted(set(train_gauges) | set(eval_gauges))
     gauge_cache: dict[str, tuple] = {}
     for gid in all_gauges:
-        result = load_gauge_data(gid, static_df, train_frac=args.train_frac)
+        result = load_gauge_data(gid, static_df,
+                                 train_frac=args.train_frac, val_frac=args.val_frac)
         if result is not None:
             gauge_cache[gid] = result
 
     if not gauge_cache:
         raise RuntimeError("没有可用站点，请检查数据路径。")
 
-    # 训练数组：每站只取训练期 [:split_idx]，传 3 元组 (dyn, sf, static)
+    # 训练/验证数组：训练取 [:train_end]；验证取 [train_end, val_end) 的窗口。
+    # 验证窗口上下文回看 CONTEXT_LEN 天（可跨入训练期，forcing 是已知输入，不算泄露），
+    # 故切片从 train_end - CONTEXT_LEN 起，使首个验证窗口的目标日恰为 train_end。
     train_arrays = []
+    val_arrays = []
     for gid in sorted(set(train_gauges)):
         if gid not in gauge_cache:
             continue
-        dyn, sf, static, split_idx = gauge_cache[gid]
-        train_arrays.append((dyn[:split_idx], sf[:split_idx], static))
+        dyn, sf, static, train_end, val_end = gauge_cache[gid]
+        train_arrays.append((dyn[:train_end], sf[:train_end], static))
+        v_start = max(0, train_end - CONTEXT_LEN)
+        val_arrays.append((dyn[v_start:val_end], sf[v_start:val_end], static))
     if not train_arrays:
         raise RuntimeError("没有可用的训练站点，请检查数据路径。")
 
@@ -290,7 +301,8 @@ def main(args: argparse.Namespace) -> None:
     if not args.skip_train:
         logger.info("开始训练 LSTM 预测径流（%d 个站点）...", len(train_arrays))
         model_lstm, dyn_mean, dyn_std, static_mean, static_std = train_lstm_streamflow(
-            gauge_arrays=train_arrays,
+            train_arrays=train_arrays,
+            val_arrays=val_arrays,
             context_len=CONTEXT_LEN,
             horizon=HORIZON,
             hidden=args.hidden,
@@ -329,7 +341,7 @@ def main(args: argparse.Namespace) -> None:
             logger.warning("[%s] 数据不可用，跳过", gid)
             continue
         logger.info("推理站点: %s", gid)
-        dyn, sf, static, split_idx = gauge_cache[gid]
+        dyn, sf, static, train_end, val_end = gauge_cache[gid]
 
         # 5a. LSTM 滚动预测径流（全序列）
         lstm_pred = rolling_predict_full(predictor, dyn, sf, static, CONTEXT_LEN, HORIZON)
@@ -343,10 +355,10 @@ def main(args: argparse.Namespace) -> None:
                 residual, model_hf, args.tf_ctx, device, gid, use_cache=not args.refresh
             )
 
-        # 5c. 评估（target 落在 [split_idx, T) 且 final 有效）
+        # 5c. 评估（target 落在 [val_end, T) 即测试期，且 final 有效）
         try:
             r = evaluate_gauge(gid, sf, lstm_pred, tf_resid, residual,
-                               eval_start=split_idx, diagnose_only=args.diagnose_only)
+                               eval_start=val_end, diagnose_only=args.diagnose_only)
             if r is not None:
                 results.append(r)
                 logger.info(
@@ -404,8 +416,10 @@ def parse_args() -> argparse.Namespace:
                    help="限制站点数量（配合 --all_gauges，便于分批/测试）")
     p.add_argument("--skip_train", action="store_true", help="跳过训练，从 _lstm_first_ckpt 加载")
     p.add_argument("--train_only", action="store_true", help="只训练 LSTM，不做推理")
-    p.add_argument("--train_frac", type=float, default=0.8,
-                   help="训练/评估时间切分比例（默认 0.8）")
+    p.add_argument("--train_frac", type=float, default=0.7,
+                   help="训练期占比（默认 0.7；训练区间 [0, train_frac)）")
+    p.add_argument("--val_frac", type=float, default=0.1,
+                   help="验证期占比（默认 0.1；验证 [train_frac, train_frac+val_frac)，其余为测试期）")
     p.add_argument("--refresh", action="store_true", help="忽略 tf_resid 缓存，强制重算")
     p.add_argument("--diagnose_only", action="store_true",
                    help="跳过 TimesFM，仅训练 LSTM + 残差诊断（无 transformers 环境也可跑）")
@@ -422,7 +436,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs",      type=int,   default=20,   help="训练轮数（默认 20）")
     p.add_argument("--train_batch", type=int,   default=512,  help="训练批大小（默认 512）")
     p.add_argument("--lr",          type=float, default=1e-3, help="学习率（默认 1e-3）")
-    p.add_argument("--stride",      type=int,   default=15,   help="训练窗口步长（默认 15）")
+    p.add_argument("--stride",      type=int,   default=1,    help="训练窗口步长（默认 1，即全部窗口；调大可下采样加速）")
     return p.parse_args()
 
 

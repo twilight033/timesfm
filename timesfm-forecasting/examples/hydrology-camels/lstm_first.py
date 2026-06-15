@@ -119,10 +119,12 @@ class _StreamflowWindowDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def train_lstm_streamflow(
-    gauge_arrays: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
-    # 每个元素：(dyn [T,N_DYN], sf [T], static [N_STATIC])
+    train_arrays: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    # 每个元素：(dyn [T,N_DYN], sf [T], static [N_STATIC])，已切到训练期
     context_len: int,
     horizon: int,
+    val_arrays: list[tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
+    # 独立验证期窗口（按时间切分得到）；为 None 时回退到从训练集随机划分
     hidden: int = 128,
     n_layers: int = 2,
     dropout: float = 0.1,
@@ -130,7 +132,7 @@ def train_lstm_streamflow(
     batch_size: int = 512,
     lr: float = 1e-3,
     val_ratio: float = 0.15,
-    stride: int = 15,
+    stride: int = 1,
     aux_weight: float = 0.2,   # 编码器辅助损失权重（预测 ctx 径流）
     device: str | None = None,
     save_dir: Path | None = None,
@@ -138,34 +140,48 @@ def train_lstm_streamflow(
     """训练 HydroLSTM（径流模式），返回 (模型, dyn_mean, dyn_std, static_mean, static_std)。"""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info("训练设备: %s，共 %d 个站点", device, len(gauge_arrays))
+    logger.info("训练设备: %s，共 %d 个站点", device, len(train_arrays))
 
-    # compute_stats 只用元组的 g[0]=dyn 与 g[2]=static，3 元组兼容
-    dyn_mean, dyn_std, static_mean, static_std = compute_stats(gauge_arrays)
+    # compute_stats 只用元组的 g[0]=dyn 与 g[2]=static，3 元组兼容；只用训练段，避免泄露
+    dyn_mean, dyn_std, static_mean, static_std = compute_stats(train_arrays)
 
-    datasets = []
-    for dyn, sf, static_raw in gauge_arrays:
-        if len(sf) < context_len + horizon:
-            continue
-        static_n = ((static_raw - static_mean) / static_std).astype(np.float32)
-        ds = _StreamflowWindowDataset(
-            dyn, sf, static_n,
-            context_len, horizon, dyn_mean, dyn_std, stride=stride,
-        )
-        if len(ds) > 0:
-            datasets.append(ds)
+    def _build_concat(arrays):
+        """按训练段统计量归一化静态，逐站建滑窗数据集并拼接（无有效窗口则返回 None）。"""
+        dsets = []
+        for dyn, sf, static_raw in arrays:
+            if len(sf) < context_len + horizon:
+                continue
+            static_n = ((static_raw - static_mean) / static_std).astype(np.float32)
+            ds = _StreamflowWindowDataset(
+                dyn, sf, static_n,
+                context_len, horizon, dyn_mean, dyn_std, stride=stride,
+            )
+            if len(ds) > 0:
+                dsets.append(ds)
+        return ConcatDataset(dsets) if dsets else None
 
-    if not datasets:
+    train_full = _build_concat(train_arrays)
+    if train_full is None:
         raise RuntimeError("没有可用的训练窗口，请检查数据。")
 
-    full_ds = ConcatDataset(datasets)
-    logger.info("有效训练窗口数: %d", len(full_ds))
+    val_full = _build_concat(val_arrays) if val_arrays is not None else None
+    if val_full is not None:
+        # 独立验证期：验证窗口目标落在训练期之后，与训练窗口时间不重叠，
+        # 故 stride=1（全窗口）也不会有自相关泄露。
+        train_ds, val_ds = train_full, val_full
+        logger.info("时间切分：训练窗口 %d，验证窗口 %d（独立验证期）",
+                    len(train_ds), len(val_ds))
+    else:
+        # 兜底：从训练集随机划分（旧行为，存在自相关泄露，仅在无独立验证期时使用）
+        if val_arrays is not None:
+            logger.warning("验证期无可用窗口，回退到从训练集随机划分验证。")
+        n_val = max(1, int(len(train_full) * val_ratio))
+        train_ds, val_ds = random_split(
+            train_full, [len(train_full) - n_val, n_val],
+            generator=torch.Generator().manual_seed(42),
+        )
+        logger.info("随机划分验证集：训练窗口 %d，验证窗口 %d", len(train_ds), len(val_ds))
 
-    n_val = max(1, int(len(full_ds) * val_ratio))
-    train_ds, val_ds = random_split(
-        full_ds, [len(full_ds) - n_val, n_val],
-        generator=torch.Generator().manual_seed(42),
-    )
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=0, pin_memory=(device != "cpu"))
     val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=0)
